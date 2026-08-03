@@ -1,0 +1,219 @@
+// ==UserScript==
+// @name         Roblox Uncopylocked Filter (Always Active)
+// @namespace    https://github.com/horridhenry228
+// @version      1.0
+// @description  Filters copy-locked games (works with infinite scroll, retries failed API checks)
+// @match        https://www.roblox.com/discover*
+// @grant        GM_xmlhttpRequest
+// @connect      games.roblox.com
+// @license      MIT
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const CHUNK_SIZE = 50;
+    const POLL_INTERVAL_MS = 3000;
+    const COOLDOWN_ON_ERROR_MS = 15000;
+
+    let cooldownUntil = 0;
+
+    function getUniverseIdFromLink(link) {
+        try {
+            const url = new URL(link.href);
+            const uid = url.searchParams.get('universeId');
+            if (uid && /^\d+$/.test(uid)) return uid;
+        } catch (e) {}
+        return null;
+    }
+
+    function getGameTiles() {
+        return document.querySelectorAll('[data-testid="game-tile"], [data-testid="wide-game-tile"]');
+    }
+
+    function fetchCopyingStatus(universeIds) {
+        if (!universeIds.length) return Promise.resolve({ status: new Map(), ok: true });
+        const url = `https://games.roblox.com/v1/games?universeIds=${universeIds.join(',')}`;
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                headers: {
+                    'Accept': 'application/json',
+                    'Origin': location.origin,
+                    'Referer': location.href
+                },
+                onload: (resp) => {
+                    if (resp.status === 429) {
+                        console.warn('[Filter] Rate limited (429), cooling down');
+                        cooldownUntil = Date.now() + COOLDOWN_ON_ERROR_MS;
+                        resolve({ status: new Map(), ok: false });
+                        return;
+                    }
+                    if (resp.status < 200 || resp.status >= 300) {
+                        console.warn(`[Filter] API returned status ${resp.status}`);
+                        resolve({ status: new Map(), ok: false });
+                        return;
+                    }
+                    try {
+                        const data = JSON.parse(resp.responseText);
+                        const status = new Map();
+                        for (const game of data.data) {
+                            status.set(String(game.id), game.copyingAllowed === true);
+                        }
+                        resolve({ status, ok: true });
+                    } catch (e) {
+                        console.warn('[Filter] Failed to parse API response', e);
+                        resolve({ status: new Map(), ok: false });
+                    }
+                },
+                onerror: () => {
+                    console.warn('[Filter] Network error, cooling down');
+                    cooldownUntil = Date.now() + COOLDOWN_ON_ERROR_MS;
+                    resolve({ status: new Map(), ok: false });
+                }
+            });
+        });
+    }
+
+    async function filterTiles() {
+        if (Date.now() < cooldownUntil) return 0;
+
+        const tiles = getGameTiles();
+        if (tiles.length === 0) return 0;
+
+        const items = [];
+        for (const tile of tiles) {
+            if (tile.dataset.uncopylockedChecked === 'true') continue;
+            if (tile.dataset.uncopylockedPending === 'true') continue;
+
+            const link = tile.querySelector('.game-card-link');
+            if (!link) continue;
+            const uid = getUniverseIdFromLink(link);
+            if (uid) {
+                tile.dataset.uncopylockedPending = 'true';
+                items.push({ uid, tile });
+            }
+        }
+        if (items.length === 0) return 0;
+
+        let removed = 0;
+
+        for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+            const chunk = items.slice(i, i + CHUNK_SIZE);
+            const universeIds = chunk.map(c => c.uid);
+            const { status, ok } = await fetchCopyingStatus(universeIds);
+
+            for (const { uid, tile } of chunk) {
+                delete tile.dataset.uncopylockedPending;
+
+                if (!ok) {
+                    continue;
+                }
+
+                tile.dataset.uncopylockedChecked = 'true';
+                if (status.get(uid) === false) {
+                    tile.remove();
+                    removed++;
+                }
+            }
+
+            if (Date.now() < cooldownUntil) break;
+        }
+
+        if (removed) console.log(`[Filter] Removed ${removed} copy-locked games`);
+        return removed;
+    }
+
+    function showMessage(removed) {
+        const old = document.querySelector('.uncopylocked-filter-indicator');
+        if (old) old.remove();
+        const div = document.createElement('div');
+        div.className = 'uncopylocked-filter-indicator';
+        div.innerHTML = `
+            <style>
+                .uncopylocked-filter-indicator {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: ${removed > 0 ? '#2e7d32' : '#f57c00'};
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 8px;
+                    font-family: system-ui, sans-serif;
+                    font-size: 14px;
+                    z-index: 10000;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                }
+            </style>
+            ${removed > 0 ? `✅ ${removed} copy-locked games removed` : 'ℹ️ No copy-locked games found'}
+        `;
+        document.body.appendChild(div);
+        setTimeout(() => div.remove(), 4000);
+    }
+
+    let busy = false;
+    let queue = false;
+    async function runFilter() {
+        if (busy) {
+            queue = true;
+            return;
+        }
+        busy = true;
+        try {
+            const removed = await filterTiles();
+            showMessage(removed);
+            if (queue) {
+                queue = false;
+                setTimeout(runFilter, 200);
+            }
+        } catch (e) { console.error(e); }
+        busy = false;
+    }
+
+    function scheduleFilter() {
+        if (!busy) runFilter();
+        else queue = true;
+    }
+
+    const observer = new MutationObserver((mutations) => {
+        let hasNew = false;
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (node.matches?.('[data-testid="game-tile"], [data-testid="wide-game-tile"]') ||
+                        node.querySelector?.('[data-testid="game-tile"], [data-testid="wide-game-tile"]')) {
+                        hasNew = true;
+                        break;
+                    }
+                }
+            }
+            if (hasNew) break;
+        }
+        if (hasNew) scheduleFilter();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    setInterval(() => {
+        if (location.pathname.includes('/discover')) scheduleFilter();
+    }, POLL_INTERVAL_MS);
+
+    let lastUrl = location.href;
+    const urlObserver = new MutationObserver(() => {
+        if (location.href !== lastUrl) {
+            lastUrl = location.href;
+            if (location.pathname.includes('/discover')) {
+                document.querySelectorAll('[data-uncopylocked-checked], [data-uncopylocked-pending]').forEach(t => {
+                    delete t.dataset.uncopylockedChecked;
+                    delete t.dataset.uncopylockedPending;
+                });
+                scheduleFilter();
+            }
+        }
+    });
+    urlObserver.observe(document.body, { childList: true, subtree: true });
+
+    if (location.pathname.includes('/discover')) {
+        setTimeout(scheduleFilter, 1500);
+    }
+})();
