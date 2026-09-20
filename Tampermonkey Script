@@ -146,7 +146,7 @@
                     box-shadow: 0 2px 10px rgba(0,0,0,0.2);
                 }
             </style>
-            ${removed > 0 ? `✅ ${removed} copy-locked games removed` : 'ℹ️ No copy-locked games found'}
+            ${removed > 0 ? `${removed} copy-locked games removed` : 'No copy-locked games found'}
         `;
         document.body.appendChild(div);
         setTimeout(() => div.remove(), 4000);
